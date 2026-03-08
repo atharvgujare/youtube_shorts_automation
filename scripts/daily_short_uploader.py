@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -85,7 +86,12 @@ def _search_candidates(queries: list[str], per_query: int) -> list[Candidate]:
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for q in queries:
-            info = ydl.extract_info(f"ytsearch{per_query}:{q}", download=False)
+            try:
+                info = ydl.extract_info(f"ytsearch{per_query}:{q}", download=False)
+            except DownloadError:
+                # In GitHub-hosted runners, YouTube can intermittently require anti-bot sign-in.
+                # Treat this as a non-fatal source lookup miss and keep trying other queries.
+                continue
             for entry in info.get("entries", []) or []:
                 if not entry:
                     continue
@@ -169,7 +175,10 @@ def _download_video(url: str, out_dir: Path) -> Path:
         out_template,
         url,
     ]
-    _run(cmd)
+    try:
+        _run(cmd)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"Source download blocked for {url}: {exc}") from exc
     matches = list(out_dir.glob("source.*"))
     if not matches:
         raise RuntimeError("Source download failed: no file generated")
@@ -267,7 +276,18 @@ def main() -> None:
         "status": "started",
     }
 
-    candidates = _search_candidates(queries, per_query)
+    try:
+        candidates = _search_candidates(queries, per_query)
+    except Exception as exc:
+        run_report.update(
+            {
+                "status": "skipped_source_discovery_blocked",
+                "reason": str(exc),
+            }
+        )
+        Path("run_report.json").write_text(json.dumps(run_report, indent=2), encoding="utf-8")
+        print("SKIP: source discovery blocked")
+        return
     ranked = sorted(candidates, key=_score, reverse=True)
 
     chosen: Candidate | None = None
@@ -293,11 +313,23 @@ def main() -> None:
 
     start_s, end_s, reason = _choose_moment(chosen)
 
-    with tempfile.TemporaryDirectory() as td:
-        work = Path(td)
-        src = _download_video(chosen.url, work)
-        short_path = Path("output_short.mp4")
-        _render_vertical_short(src, start_s, end_s, short_path)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            src = _download_video(chosen.url, work)
+            short_path = Path("output_short.mp4")
+            _render_vertical_short(src, start_s, end_s, short_path)
+    except Exception as exc:
+        run_report.update(
+            {
+                "status": "skipped_source_fetch_blocked",
+                "source_url": chosen.url,
+                "reason": str(exc),
+            }
+        )
+        Path("run_report.json").write_text(json.dumps(run_report, indent=2), encoding="utf-8")
+        print("SKIP: source fetch blocked")
+        return
 
     short_title = _sanitize_title(f"{chosen.title} | 60s Highlight")
     desc = (

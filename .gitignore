@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+tmp_cc/
+*.mp4
+*.vtt
+run_report.json
+output_short.mp4
